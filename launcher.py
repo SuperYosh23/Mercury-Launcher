@@ -1,15 +1,15 @@
 import os
 import sys
 import subprocess
-import threading # Added for background tasks
+import threading
+import json
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from PIL import Image, ImageTk
+from tkinter import ttk, filedialog, messagebox, simpledialog
 import minecraft_launcher_lib
 import shutil
 
 # -------------------------
-# Paths
+# Global Paths
 # -------------------------
 def get_minecraft_dir():
     if sys.platform.startswith("win"):
@@ -18,173 +18,341 @@ def get_minecraft_dir():
         return os.path.expanduser("~/.minecraft")
 
 MINECRAFT_DIR = get_minecraft_dir()
+INSTANCES_DIR = os.path.join(MINECRAFT_DIR, "mercury_instances")
+CONFIG_FILE = os.path.join(MINECRAFT_DIR, "mercury_config.json")
+
+# Ensure base folders exist
+os.makedirs(INSTANCES_DIR, exist_ok=True)
 
 # -------------------------
-# Mercury Launcher UI
+# Mercury Launcher Class
 # -------------------------
 class MercuryLauncher:
     def __init__(self, root):
         self.root = root
-        self.root.title("Mercury Launcher")
-        self.root.geometry("520x600") # Increased height for progress bar
+        self.root.title("Mercury Launcher - Multi-Instance")
+        self.root.geometry("800x550") # Wider for the dashboard look
         self.root.configure(bg="#1e1e1e")
-        self.root.resizable(False, False)
 
-        # Modern ttk style
-        self.style = ttk.Style(root)
+        # Data
+        self.instances = self.load_config()
+        self.current_instance_name = None
+        self.available_versions = []
+
+        # Styles
+        self.setup_styles()
+
+        # --- UI Layout (Paned Window) ---
+        # Split into Left (List) and Right (Details)
+        self.main_pane = tk.PanedWindow(root, orient="horizontal", bg="#1e1e1e", sashwidth=4)
+        self.main_pane.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # === LEFT PANEL: Instance List ===
+        self.left_frame = tk.Frame(self.main_pane, bg="#252526")
+        self.main_pane.add(self.left_frame, minsize=200, width=250)
+
+        # Title
+        tk.Label(self.left_frame, text="My Instances", bg="#252526", fg="#00d1ff", font=("Segoe UI", 14, "bold")).pack(pady=10)
+
+        # Listbox with Scrollbar
+        list_frame = tk.Frame(self.left_frame, bg="#252526")
+        list_frame.pack(fill="both", expand=True, padx=10)
+
+        self.instance_listbox = tk.Listbox(list_frame, bg="#303031", fg="white", borderwidth=0, highlightthickness=0, selectbackground="#007acc", font=("Segoe UI", 11))
+        self.instance_listbox.pack(side="left", fill="both", expand=True)
+        self.instance_listbox.bind("<<ListboxSelect>>", self.on_instance_select)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.instance_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.instance_listbox.config(yscrollcommand=scrollbar.set)
+
+        # Bottom Buttons (Add/Remove)
+        btn_frame = tk.Frame(self.left_frame, bg="#252526")
+        btn_frame.pack(fill="x", pady=10, padx=10)
+
+        ttk.Button(btn_frame, text="+ New Instance", command=self.add_instance).pack(side="left", fill="x", expand=True, padx=(0,5))
+        ttk.Button(btn_frame, text="- Delete", command=self.delete_instance).pack(side="right", fill="x", expand=True, padx=(5,0))
+
+
+        # === RIGHT PANEL: Details & Settings ===
+        self.right_frame = tk.Frame(self.main_pane, bg="#1e1e1e")
+        self.main_pane.add(self.right_frame, minsize=400)
+
+        # Header
+        self.header_label = tk.Label(self.right_frame, text="Select an Instance", bg="#1e1e1e", fg="white", font=("Segoe UI", 20, "bold"))
+        self.header_label.pack(pady=(20, 20))
+
+        # Settings Container
+        self.settings_frame = tk.Frame(self.right_frame, bg="#1e1e1e")
+        self.settings_frame.pack(fill="x", padx=40)
+
+        # Username
+        ttk.Label(self.settings_frame, text="Username").pack(anchor="w", pady=(0,2))
+        self.username_entry = ttk.Entry(self.settings_frame)
+        self.username_entry.pack(fill="x", pady=(0, 15))
+
+        # Version
+        ttk.Label(self.settings_frame, text="Minecraft Version").pack(anchor="w", pady=(0,2))
+        self.version_combo = ttk.Combobox(self.settings_frame, state="readonly")
+        self.version_combo.pack(fill="x", pady=(0, 15))
+
+        # Mod Loader
+        ttk.Label(self.settings_frame, text="Mod Loader").pack(anchor="w", pady=(0,2))
+        self.loader_combo = ttk.Combobox(self.settings_frame, state="readonly", values=["Vanilla", "Fabric", "Forge"])
+        self.loader_combo.pack(fill="x", pady=(0, 15))
+
+        # Management Buttons
+        self.mods_btn = ttk.Button(self.settings_frame, text="📂 Open Mods Folder", command=self.open_mods_folder)
+        self.mods_btn.pack(fill="x", pady=(0, 20))
+
+        # Status & Launch
+        self.status_label = tk.Label(self.right_frame, text="", bg="#1e1e1e", fg="#aaaaaa", font=("Segoe UI", 9))
+        self.status_label.pack(side="bottom", pady=(0, 10))
+
+        self.launch_btn = ttk.Button(self.right_frame, text="Launch Instance", command=self.start_launch_thread)
+        self.launch_btn.pack(side="bottom", pady=(0, 10), ipadx=30, ipady=10)
+
+        # Initial Load
+        self.refresh_instance_list()
+
+        # Start background version fetch
+        threading.Thread(target=self.load_versions_bg, daemon=True).start()
+
+    # -------------------------
+    # Styling
+    # -------------------------
+    def setup_styles(self):
+        self.style = ttk.Style(self.root)
         self.style.theme_use("clam")
-
-        # Dark theme configuration
         self.style.configure("TLabel", background="#1e1e1e", foreground="#ffffff", font=("Segoe UI", 10))
         self.style.configure("TButton", font=("Segoe UI", 10, "bold"), foreground="#ffffff", background="#3a3a3a", borderwidth=0)
         self.style.map("TButton", background=[("active", "#505050")])
         self.style.configure("TEntry", fieldbackground="#3a3a3a", foreground="#ffffff", insertcolor="white")
         self.style.configure("TCombobox", fieldbackground="#3a3a3a", background="#1e1e1e", foreground="#ffffff", arrowcolor="white")
 
-        # Title
-        title = tk.Label(root, text="Mercury Launcher", font=("Segoe UI", 24, "bold"), bg="#1e1e1e", fg="#00d1ff")
-        title.pack(pady=20)
-
-        # Container Frame
-        self.frame = tk.Frame(root, bg="#1e1e1e")
-        self.frame.pack(padx=30, fill="x")
-
-        # Username
-        ttk.Label(self.frame, text="Username").pack(anchor="w", pady=(0,2))
-        self.username_entry = ttk.Entry(self.frame)
-        self.username_entry.pack(fill="x", pady=(0,15))
-
-        # Instance Name
-        ttk.Label(self.frame, text="Instance Name (Subfolder)").pack(anchor="w", pady=(0,2))
-        self.instance_entry = ttk.Entry(self.frame)
-        self.instance_entry.insert(0, "default")
-        self.instance_entry.pack(fill="x", pady=(0,15))
-
-        # Version Selector (Changed to Combobox)
-        ttk.Label(self.frame, text="Minecraft Version").pack(anchor="w", pady=(0,2))
-        self.version_combo = ttk.Combobox(self.frame, state="readonly")
-        self.version_combo.pack(fill="x", pady=(0,15))
-
-        # Load versions in background to not freeze startup
-        threading.Thread(target=self.load_versions, daemon=True).start()
-
-        # Skin Section
-        ttk.Label(self.frame, text="Skin (Visual only - requires mod for in-game)").pack(anchor="w", pady=(0,2))
-        self.skin_frame = tk.Frame(self.frame, bg="#1e1e1e")
-        self.skin_frame.pack(fill="x", pady=(0,10))
-        self.skin_path_var = tk.StringVar()
-        ttk.Entry(self.skin_frame, textvariable=self.skin_path_var).pack(side="left", fill="x", expand=True)
-        ttk.Button(self.skin_frame, text="Browse", command=self.browse_skin).pack(side="left", padx=5)
-
-        # Skin Preview Card
-        self.skin_preview_card = tk.Frame(root, bg="#2d2d2d", width=80, height=80)
-        self.skin_preview_card.pack(pady=5)
-        self.skin_preview_card.pack_propagate(False)
-        self.skin_preview_label = tk.Label(self.skin_preview_card, bg="#2d2d2d")
-        self.skin_preview_label.pack(expand=True)
-
-        # Progress Info
-        self.status_label = tk.Label(root, text="Ready", bg="#1e1e1e", fg="#aaaaaa", font=("Segoe UI", 9))
-        self.status_label.pack(pady=(10, 0))
-
-        # Launch Button
-        self.launch_btn = ttk.Button(root, text="Download & Launch", command=self.start_launch_thread)
-        self.launch_btn.pack(pady=15, ipadx=20, ipady=8)
-
     # -------------------------
-    # Logic
+    # Data Management
     # -------------------------
-    def load_versions(self):
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    def save_config(self):
+        # Save current inputs to the current instance in memory before writing to file
+        if self.current_instance_name:
+            self.instances[self.current_instance_name] = {
+                "username": self.username_entry.get(),
+                "version": self.version_combo.get(),
+                "loader": self.loader_combo.get()
+            }
+
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.instances, f, indent=4)
+
+    def load_versions_bg(self):
         try:
             versions = minecraft_launcher_lib.utils.get_version_list()
-            release_versions = [v["id"] for v in versions if v["type"] == "release"]
-            # Schedule UI update on main thread
-            self.root.after(0, lambda: self.version_combo.configure(values=release_versions[:30]))
-            if release_versions:
-                self.root.after(0, lambda: self.version_combo.set(release_versions[0]))
-        except Exception:
-            self.root.after(0, lambda: messagebox.showerror("Error", "Could not fetch versions"))
-
-    def browse_skin(self):
-        path = filedialog.askopenfilename(title="Select Skin PNG", filetypes=[("PNG Images", "*.png")])
-        if path:
-            self.skin_path_var.set(path)
-            self.update_skin_preview(path)
-
-    def update_skin_preview(self, path):
-        try:
-            img = Image.open(path)
-            # Resize keeping aspect ratio
-            img.thumbnail((64, 64))
-            self.skin_image = ImageTk.PhotoImage(img)
-            self.skin_preview_label.config(image=self.skin_image)
-        except Exception:
+            self.available_versions = [v["id"] for v in versions if v["type"] == "release"]
+            self.root.after(0, lambda: self.version_combo.configure(values=self.available_versions[:50]))
+        except:
             pass
 
+    # -------------------------
+    # GUI Logic
+    # -------------------------
+    def refresh_instance_list(self):
+        self.instance_listbox.delete(0, tk.END)
+        for name in self.instances:
+            self.instance_listbox.insert(tk.END, name)
+
+    def add_instance(self):
+        name = simpledialog.askstring("New Instance", "Enter name for new instance:")
+        if name:
+            if name in self.instances:
+                messagebox.showerror("Error", "Instance already exists!")
+                return
+
+            # Create default data
+            self.instances[name] = {
+                "username": "",
+                "version": self.available_versions[0] if self.available_versions else "1.20.4",
+                "loader": "Vanilla"
+            }
+            self.save_config()
+            self.refresh_instance_list()
+
+            # Select the new one
+            idx = self.instance_listbox.get(0, tk.END).index(name)
+            self.instance_listbox.selection_clear(0, tk.END)
+            self.instance_listbox.selection_set(idx)
+            self.on_instance_select(None)
+
+    def delete_instance(self):
+        sel = self.instance_listbox.curselection()
+        if not sel: return
+        name = self.instance_listbox.get(sel[0])
+
+        if messagebox.askyesno("Delete", f"Are you sure you want to delete '{name}'?\nThis will remove its configs but keep the folder files."):
+            del self.instances[name]
+            self.save_config()
+            self.refresh_instance_list()
+
+            # Clear right panel
+            self.current_instance_name = None
+            self.header_label.config(text="Select an Instance")
+            self.username_entry.delete(0, tk.END)
+            self.version_combo.set('')
+            self.loader_combo.set('')
+
+    def on_instance_select(self, event):
+        # 1. Save previous if exists
+        self.save_config()
+
+        # 2. Load new
+        sel = self.instance_listbox.curselection()
+        if not sel: return
+
+        name = self.instance_listbox.get(sel[0])
+        self.current_instance_name = name
+        data = self.instances[name]
+
+        self.header_label.config(text=name)
+
+        self.username_entry.delete(0, tk.END)
+        self.username_entry.insert(0, data.get("username", ""))
+
+        self.version_combo.set(data.get("version", ""))
+        self.loader_combo.set(data.get("loader", "Vanilla"))
+
+    def open_mods_folder(self):
+        if not self.current_instance_name: return
+
+        instance_path = os.path.join(INSTANCES_DIR, self.current_instance_name)
+        mods_path = os.path.join(instance_path, "mods")
+        os.makedirs(mods_path, exist_ok=True)
+
+        # Open folder based on OS
+        if sys.platform == "win32":
+            os.startfile(mods_path)
+        else:
+            subprocess.Popen(["xdg-open", mods_path])
+
+    # -------------------------
+    # Launch Logic
+    # -------------------------
     def start_launch_thread(self):
-        # Disable button to prevent double clicks
-        self.launch_btn.config(state="disabled")
-        self.status_label.config(text="Initializing...")
-
-        # Start the heavy lifting in a new thread
-        threading.Thread(target=self.launch, daemon=True).start()
-
-    def launch(self):
-        username = self.username_entry.get().strip()
-        version = self.version_combo.get()
-        instance_name = self.instance_entry.get().strip() or "default"
-        instance_dir = os.path.join(MINECRAFT_DIR, "instances", instance_name)
-        os.makedirs(instance_dir, exist_ok=True)
-
-        if not username or not version:
-            self.root.after(0, lambda: messagebox.showerror("Error", "Username and Version required"))
-            self.root.after(0, lambda: self.launch_btn.config(state="normal"))
+        if not self.current_instance_name:
+            messagebox.showwarning("Warning", "Please select an instance first.")
             return
 
-        # Callback to update UI from the background thread
-        def update_status(text):
-            self.status_label.config(text=text)
+        self.save_config() # Save changes before launch
+        self.launch_btn.config(state="disabled")
+        threading.Thread(target=self.launch, daemon=True).start()
 
-        # Callback for download progress
-        def progress_callback(current, max_val, text):
-            self.root.after(0, lambda: update_status(f"{text}: {current}/{max_val}"))
+    def find_internal_java(self):
+        runtime_dir = os.path.join(MINECRAFT_DIR, "runtime")
+        found_java = None
+        if os.path.exists(runtime_dir):
+            for root, dirs, files in os.walk(runtime_dir):
+                if "java" in files:
+                    full_path = os.path.join(root, "java")
+                    if sys.platform != "win32":
+                        try: os.chmod(full_path, 0o755)
+                        except: pass
+                    if "bin" in root:
+                        found_java = full_path
+                        break
+        return found_java if found_java else "java"
 
+    def update_status(self, text, error=False):
+        self.root.after(0, lambda: self.status_label.config(text=text, fg="#ff5555" if error else "#aaaaaa"))
+        if error:
+            self.root.after(0, lambda: messagebox.showerror("Launch Error", text))
+
+        if error or "Launching" in text:
+             self.root.after(0, lambda: self.launch_btn.config(state="normal"))
+
+    def launch(self):
         try:
-            self.root.after(0, lambda: update_status("Checking/Downloading Game Files..."))
+            # Get Data
+            data = self.instances[self.current_instance_name]
+            username = data["username"]
+            version = data["version"]
+            loader = data["loader"]
 
-            # Install with callbacks
+            # Setup Paths
+            instance_dir = os.path.join(INSTANCES_DIR, self.current_instance_name)
+            os.makedirs(instance_dir, exist_ok=True)
+
+            if not username or not version:
+                self.update_status("Error: Username and Version required", error=True)
+                return
+
+            def set_status(text):
+                self.root.after(0, lambda: self.status_label.config(text=text))
+
+            # 1. Install Vanilla
+            set_status(f"Verifying Vanilla {version}...")
             minecraft_launcher_lib.install.install_minecraft_version(
                 version=version,
                 minecraft_directory=MINECRAFT_DIR,
-                callback={'setStatus': lambda text: self.root.after(0, lambda: update_status(text))}
+                callback={'setStatus': set_status}
             )
+
+            # 2. Java Setup
+            java_path = self.find_internal_java()
+            if java_path != "java":
+                os.environ["PATH"] = os.path.dirname(java_path) + os.pathsep + os.environ["PATH"]
+
+            # 3. Mod Loader
+            launch_id = version
+
+            if loader == "Fabric":
+                set_status("Installing Fabric...")
+                launch_id = minecraft_launcher_lib.fabric.install_fabric(version, MINECRAFT_DIR)
+                if not launch_id:
+                     # Fallback search
+                     for v in minecraft_launcher_lib.utils.get_installed_versions(MINECRAFT_DIR):
+                        if "fabric" in v["id"] and version in v["id"]:
+                            launch_id = v["id"]
+                            break
+
+            elif loader == "Forge":
+                set_status("Finding Forge...")
+                forge_ver = minecraft_launcher_lib.forge.find_forge_version(version)
+                if not forge_ver: raise Exception("Forge not found")
+
+                set_status(f"Installing Forge {forge_ver}...")
+                minecraft_launcher_lib.forge.install_forge_version(forge_ver, MINECRAFT_DIR, java=java_path)
+                launch_id = forge_ver
+
+            # 4. Launch
+            set_status(f"Launching {launch_id}...")
 
             options = {
                 "username": username,
-                "uuid": "0", # Offline mode UUID
+                "uuid": "0",
                 "token": "0",
-                "launcherName": "MercuryLauncher",
-                "gameDir": instance_dir,
+                "launcherName": "Mercury",
+                "gameDir": instance_dir, # This creates the isolation!
+                "executablePath": java_path,
             }
 
-            self.root.after(0, lambda: update_status("Launching..."))
+            cmd = minecraft_launcher_lib.command.get_minecraft_command(launch_id, MINECRAFT_DIR, options)
+            subprocess.Popen(cmd)
 
-            command = minecraft_launcher_lib.command.get_minecraft_command(version, MINECRAFT_DIR, options)
-
-            # Launch the game
-            subprocess.Popen(command)
-
-            # Close launcher
+            # Close launcher on success
             self.root.after(0, self.root.destroy)
 
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Launch Error", str(e)))
-            self.root.after(0, lambda: self.launch_btn.config(state="normal"))
-            self.root.after(0, lambda: update_status("Error occurred"))
+            print(e)
+            self.update_status(str(e), error=True)
 
-# -------------------------
-# Run Launcher
-# -------------------------
 if __name__ == "__main__":
     root = tk.Tk()
     app = MercuryLauncher(root)
